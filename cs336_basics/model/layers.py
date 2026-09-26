@@ -78,4 +78,20 @@ class RMSNorm(torch.nn.Module):
 
         x_dtype = x.dtype
         x_float = x.to(torch.float32)
-        
+
+        # compute RMS on the d_model axis for every vector in the leading dimension, 
+        # so we go from R^ B x S x d_model to R^ B x S (x 1, [float] for RMS, we keepdim).
+        # this will be our RMS tensor as it must apply for every activation in B, S
+        rms = torch.sqrt((x_float**2).mean(dim=-1, keepdim=True) + (self.eps))
+
+        # now apply rms to every activiation using RMSNorm(a_i) = a_i/RMS(a) * g_i
+        # where i is the index of the activation in a in d_model
+        # RMS(a) is the entry that corresponds to the same location in the leading dimensions of rms and the activation tensor
+        # g is our learned weight tensor which is of shape (d_model)
+        # pytorch uses broadcasting, so the dimension of shape 1 gets repeated d_model times when we do our element-wise division,
+        # and the leading dimensions line up, so everything matches.
+        # then when it's time to multiply element-wise by g, pytorch uses broadcasting again to see the rightmost dimensions
+        # of x and self.weight line up. Then pytorch broadcasts the elements of g to its missing dimensions to match the shape of x.
+        # thus every single entry in B, S get a g vector. 
+        # Then pytorch does element-wise multiplication on B,S, (activation vectors) and B,S, (g vector repeated)
+        return ((x_float/rms)*self.weight).to(x_dtype)
