@@ -1,7 +1,10 @@
 import torch
 from torch import nn
 import math
-from einops import einsum
+from einops import einsum, rearrange
+
+from .functional import silu, scaled_dot_product_attention
+from .rope import RotaryPositionEmbedding
 
 # Linear is the model's basic learned matrix multiply, y = Mx, with no bias. It is the most reused part in the transformer:
 # The attention projections Q, K, V, out
@@ -59,7 +62,7 @@ class Embedding(torch.nn.Module):
 
 
 class RMSNorm(torch.nn.Module):
-    def __init__(self, d_model: int, eps: float = 1e-5, device: torch.device | None =None, dtype: torch.dtype | None =None):
+    def __init__(self, d_model: int, eps: float = 1e-5, device: torch.device | None = None, dtype: torch.dtype | None =None):
         # one learnable parameter, the gain
         super().__init__()
         t = torch.empty(d_model, device=device, dtype=dtype)
@@ -95,3 +98,83 @@ class RMSNorm(torch.nn.Module):
         # thus every single entry in B, S get a g vector. 
         # Then pytorch does element-wise multiplication on B,S, (activation vectors) and B,S, (g vector repeated)
         return ((x_float/rms)*self.weight).to(x_dtype)
+
+class SwiGLU(torch.nn.Module):
+    def __init__(self, d_model: int, d_ff: int, device: torch.device | None = None, dtype: torch.dtype | None = None):
+        # three learnable parameters, W1, W2 and W3 are weights of Linear modules
+        # these are Linear objects
+        super().__init__()
+        self.w1 = Linear(d_model, d_ff, device, dtype)
+        self.w2 = Linear(d_ff, d_model, device, dtype)
+        self.w3 = Linear(d_model, d_ff, device, dtype)
+    
+    def forward(self, x:torch.Tensor) -> torch.Tensor:
+        # do SwiGLU
+        silu_w1_x = silu(self.w1(x))
+        w3_x = self.w3(x)
+        silu_w1_x_dot_w3_x = silu_w1_x * w3_x
+        return self.w2(silu_w1_x_dot_w3_x)
+
+class multihead_self_attention(torch.nn.Module):
+    def __init__(self, d_model: int, num_heads: int, d_k: int | None = None, d_v: int | None = None, 
+    theta: float | None = None, max_seq_len: int | None = None, # rope params
+    device: torch.device | None = None, dtype: torch.dtype | None = None):
+        super().__init__()
+        # d_k = d_v = d_model / h by default
+        # so d_k*h and d_v*h = d_model, 
+        # I'm going to also allow custom shaped QKV parameter matrices optionally
+        if d_k is None:
+            d_k = d_model // num_heads
+        if d_v is None:
+            d_v = d_model // num_heads
+        # store num_heads
+        self.num_heads = num_heads
+        # name the dimensions for the proper dict attribute names
+        self.q_proj = Linear(d_model, num_heads * d_k, device, dtype)
+        self.k_proj = Linear(d_model, num_heads * d_k, device, dtype)
+        self.v_proj = Linear(d_model, num_heads * d_v, device, dtype)
+        self.output_proj = Linear(num_heads * d_v, d_model, device, dtype)
+
+        if (theta is not None) and (max_seq_len is not None):
+            self.rope = RotaryPositionEmbedding(theta, d_k, max_seq_len, device)
+        else:
+            self.rope = None
+    
+    def forward(self, x: torch.Tensor, token_positions: torch.Tensor | None = None) -> torch.Tensor:
+        # build the mask from the dimensions of x, assume [-2] is seq_len and the x.device is good
+        # assume x is the shape ... seq_len d_model
+        mask = torch.ones(x.shape[-2], x.shape[-2], device = x.device)
+        mask = (torch.triu(mask, diagonal=1) == 0)
+        # create the QKV matrices from the block Linears and x
+        Q = self.q_proj(x) # shape seq_len, num_heads * dk
+        K = self.k_proj(x) # shape seq_len, num_heads * dk
+        V = self.v_proj(x) # shape seq_len, num_heads * dv
+        # split up QKV into num_heads column vectors across (num_heads * d_k) where the last dimension is the head dimension
+        Q = rearrange(Q, "... seq_len (num_heads d_k) -> ... num_heads seq_len d_k", num_heads = self.num_heads)
+        K = rearrange(K, "... seq_len (num_heads d_k) -> ... num_heads seq_len d_k", num_heads = self.num_heads)
+        V = rearrange(V, "... seq_len (num_heads d_v) -> ... num_heads seq_len d_v", num_heads = self.num_heads)
+
+        # apply rope 
+        if self.rope is not None:
+            if token_positions is None:
+                # x[-2] is sequence length 
+                token_positions = torch.arange(0, x.shape[-2])
+            else:
+                # we might be given a tensor of token positions of the shape batch, seq
+                # rope should then be looking at each batch separately for each head
+                # rope then uses the token position vector to rearrange sin and cos tables
+                # the token position vector could be different for each batch, and we need this to line up with
+                # our batch dimension in Q and K. but right now, we are comparing
+                # batch, num_heads, seq against batch, seq, and then num_heads would right align with batch (bad)
+                # thanks AI, I would have never caught this with all the dimension splitting and stuff
+                # we insert a dimension of size one in between batch and num_heads in token_positions to avoid this and broadcast properly
+                token_positions = token_positions.unsqueeze(-2)
+            Q = self.rope(Q, token_positions)
+            K = self.rope(K, token_positions)
+        # now we must apply scaled dot product attention to each QiKiVi set, indexed by the -3 dimension
+        # surely we can do this in place, batching by the num_heads [-3] dimension, and our SDPA does this automatically
+        # considering it batches over anything before the last two dimensions of QKV
+        multihead = scaled_dot_product_attention(Q, K, V, mask)
+        # now we merge it all back together across the num_heads dimension
+        multihead = rearrange(multihead, "... num_heads seq_len d_v -> ... seq_len (num_heads d_v)", num_heads = self.num_heads)
+        return self.output_proj(multihead)
