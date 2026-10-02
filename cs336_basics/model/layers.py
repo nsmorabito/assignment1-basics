@@ -158,7 +158,7 @@ class multihead_self_attention(torch.nn.Module):
         if self.rope is not None:
             if token_positions is None:
                 # x[-2] is sequence length 
-                token_positions = torch.arange(0, x.shape[-2])
+                token_positions = torch.arange(0, x.shape[-2]).to(x.device)
             else:
                 # we might be given a tensor of token positions of the shape batch, seq
                 # rope should then be looking at each batch separately for each head

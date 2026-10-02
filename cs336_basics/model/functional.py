@@ -34,3 +34,19 @@ def scaled_dot_product_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tens
     # dimension d_v (this is the same as d_model/h in our implementation, as attention is applied to the split up QKV tensors individually)
     softmax_inner = softmax(masked_inner, -1)
     return einsum(softmax_inner, v, "... seq_len_queries seq_len_keys, ... seq_len_keys d_v -> ... seq_len_queries d_v")
+
+def cross_entropy_loss( logits: torch.Tensor, training_set_valid: torch.Tensor) -> torch.Tensor:
+    # compute the loss at every position in BxS and average them up
+    # don't do softmax over everything 
+    # instead use log rules and softmax rules over the logit dimension each time
+
+    # "normalize" the logits by subtracting the max logit at each position in B x S from all the logits in the logit vector (dim -1)
+    normalized_logits = logits - logits.amax(dim=-1, keepdim=True)
+    # then get the loss term at each position in BxS.
+    # this is done by using the indexes of the training set, which we assume is the shifted part (that's why we call it training_set_valid)
+    # we end up with a BxS matrix of loss scalars at the end of all of this
+    # to make it easier, construct two tensors, one with the normalized logit values at the position we want, the other with the logged sum
+    correct_normalized_logits_values = normalized_logits.gather(-1, training_set_valid.unsqueeze(-1))
+    logged_summed_normalized_logits_values = torch.log(torch.exp(normalized_logits).sum(dim=-1, keepdim=True))
+    softmaxxed_logged_logits = - correct_normalized_logits_values + logged_summed_normalized_logits_values
+    return torch.mean(softmaxxed_logged_logits)
