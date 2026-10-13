@@ -2,6 +2,7 @@ from collections.abc import Iterable, Iterator
 from .serialization import load_gpt2_vocab, load_gpt2_merges
 import regex as re
 import json
+import pickle
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
@@ -26,10 +27,22 @@ class Tokenizer:
 
     # looks like the vocab file is actually in the form of reversed vocab
     @classmethod
-    def from_files(cls, vocab_filepath: str, merges_filepath: str, special_tokens: list[str] | None = None) -> "Tokenizer":
-        vocab = load_gpt2_vocab(vocab_filepath)
-        merges = load_gpt2_merges(merges_filepath)
-        return cls(vocab, merges, special_tokens)
+    def from_files(cls, vocab_filepath: str, merges_filepath: str, special_tokens: list[str] | None = None, special_tokens_filepath: str | None = None, use_gpt: bool | None = False) -> "Tokenizer":
+        if use_gpt:
+            vocab = load_gpt2_vocab(vocab_filepath)
+            merges = load_gpt2_merges(merges_filepath)
+            special_tokens_list = special_tokens
+        else:
+            with open(vocab_filepath, "rb") as f:
+                vocab = pickle.load(f)
+            with open(merges_filepath, "rb") as f:
+                merges = pickle.load(f)
+            if special_tokens_filepath is not None:
+                with open(special_tokens_filepath, "rb") as f:
+                    special_tokens_list = pickle.load(f)
+            else: 
+                special_tokens_list = special_tokens
+        return cls(vocab, merges, special_tokens_list)
 
     # applies the merges to a pre-token word
     def _apply_merges_word(self, word: tuple[bytes, ...]) -> tuple[bytes, ...]:
@@ -109,3 +122,15 @@ class Tokenizer:
     def decode(self, ids: list[int]) -> str:
         decoded_bytes = b"".join(self.vocab[x] for x in ids)
         return decoded_bytes.decode("utf-8", errors="replace")
+
+    def save_tokenizer_pieces(self, out_dir):
+        # save the pieces of the Tokenizer, in case the tokenizer ever changes or encoding changes,
+        # instead of saving the Tokenizer as a whole
+        with open(f"{out_dir}/vocab.pkl", "wb") as f:
+            pickle.dump(self.vocab, f)
+        with open(f"{out_dir}/merges.pkl", "wb") as f:
+            # sort merge_ranks on the ranks and dump the list of values 
+            merge_list = sorted(self.merge_ranks, key=self.merge_ranks.get)
+            pickle.dump(merge_list, f)
+        with open(f"{out_dir}/special_tokens.pkl", "wb") as f:
+            pickle.dump(self.special_tokens,f )

@@ -34,6 +34,7 @@
 import os
 import regex as re
 from collections import Counter
+from tqdm import tqdm
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
@@ -56,9 +57,9 @@ def split_input_string(input_string: str, special_tokens: list[str]) -> list[str
 
 # pre-tokenize each split input string with GPT2's regex pattern
 # then count the ocurrences of each word and return a Counter[str]
-def count_substrings(input_list: list[str]) -> Counter[str] :
+def count_substrings(input_list: list[str], show_progress: bool = False) -> Counter[str] :
     substring_counter = Counter()
-    for split_string in input_list:
+    for split_string in tqdm(input_list, desc="pre-tokenizing", unit=" docs", disable=not show_progress):
         # returns an iterator of Match objects
         split_substring = re.finditer(PAT, split_string)
         for word in split_substring:
@@ -176,26 +177,28 @@ def merge(vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]], token_tupl
     return [remove, add, new_token_tuple_counter]
 
 # the train_bpe full loop - take a filepath, a max vocab size, and a list of special tokens and return the vocab dict and the list of merges
-def train_bpe(input_path: str | os.PathLike, vocab_size: int, special_tokens=None) -> [dict[int, bytes], list[tuple[bytes, bytes]]]:
+def train_bpe(input_path: str | os.PathLike, vocab_size: int, special_tokens=None, show_progress: bool = False) -> [dict[int, bytes], list[tuple[bytes, bytes]]]:
 
     if special_tokens is None:
         special_tokens = []
     input_string = get_input_string(input_path)
     split_input_string_list  = split_input_string(input_string, special_tokens)
-    input_substring_word_count = count_substrings(split_input_string_list)
+    input_substring_word_count = count_substrings(split_input_string_list, show_progress)
     token_tuple_counter = string_to_bytes_counter(input_substring_word_count)
 
     vocab = build_initial_vocab(special_tokens)
     merges = []
     counted_pairs = count_pairs(token_tuple_counter)
     # now we have taken our input file and converted it to a counter of byte tuples. we have also defined our starting vocab.
+    merge_progress = tqdm(total=max(vocab_size - len(vocab), 0), desc="merging", unit=" merges", disable=not show_progress)
     while len(vocab) < vocab_size:
-        
+
         max_token_pair = find_max_token_pair(counted_pairs)
         if max_token_pair is None:
             break
         [remove, add, token_tuple_counter] = merge(vocab, merges, token_tuple_counter, max_token_pair)
         update_count_pairs_during_merge(counted_pairs, remove, add)
+        merge_progress.update(1)
+    merge_progress.close()
     return [vocab, merges]
 
-train_bpe("tests/fixtures/corpus.en", vocab_size=500, special_tokens=["<|endoftext|>"])
