@@ -9,6 +9,11 @@ __pycache__/
 # data
 data/
 
+# CO AUTHORED BY CLAUDE
+# profiler outputs (Nsight Systems reports and their exported databases)
+*.nsys-rep
+*.sqlite
+
 # Distribution / packaging
 .Python
 build/
