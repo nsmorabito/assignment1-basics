@@ -6,6 +6,8 @@ Run from the repo root, for example:
     uv run python -m cs336_systems.benchmark --size all --mode forward
     uv run python -m cs336_systems.benchmark --size medium --context-length 1024 --warmup 0
     uv run python -m cs336_systems.benchmark --size small --num-layers 4     # override any dimension
+    uv run python -m cs336_systems.benchmark --size small --warmup 1 --steps 2 \
+        --memory-snapshot profiles/mem_small.pickle                          # memory snapshot (CUDA only)
 
 Modes:
     forward           forward pass + loss only, under torch.no_grad() (inference)
@@ -14,12 +16,17 @@ Modes:
 
 Each measured step is timed per phase, with a device synchronize after every phase so the timer
 waits for the GPU to actually finish instead of just for the kernel launches to return.
+
+With --memory-snapshot, PyTorch's allocator records every allocation/free (with stack traces) from before
+the model is built until the end of the run, and the history is dumped to a pickle for pytorch.org/memory_viz.
+Recording slows the CPU side, so timings from snapshot runs are not comparable with plain runs.
 """
 import argparse
 import dataclasses
 import gc
 import statistics
 import timeit
+from pathlib import Path
 
 import torch
 
@@ -39,6 +46,8 @@ from cs336_systems.model_configs import (
 
 MODES = ("forward", "forward_backward", "train")
 PHASES = ("forward", "backward", "optimizer")
+# cap on recorded allocation events so a long run can't make the snapshot (and host memory) grow without bound
+MEMORY_HISTORY_MAX_ENTRIES = 1_000_000
 
 
 def default_device() -> str:
@@ -105,12 +114,32 @@ def mean_std_ms(values: list[float]) -> tuple[float, float]:
     return statistics.mean(values) * 1000, std * 1000
 
 
-def benchmark(size: ModelSize, context_length: int, batch_size: int, mode: str, warmup: int, steps: int, device: str) -> dict:
+# where one config's snapshot goes: the given path, or path_<size> when several sizes run in one invocation
+def snapshot_path(base: str, size_name: str, multiple_sizes: bool) -> str:
+    path = Path(base)
+    if multiple_sizes:
+        safe_name = size_name.replace("*", "_custom")
+        path = path.with_name(f"{path.stem}_{safe_name}{path.suffix or '.pickle'}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return str(path)
+
+
+def dump_memory_snapshot(path: str) -> None:
+    torch.cuda.memory._dump_snapshot(path)
+    print(f"    memory snapshot written to {path}", flush=True)
+
+
+def benchmark(size: ModelSize, context_length: int, batch_size: int, mode: str, warmup: int, steps: int, device: str,
+              memory_snapshot: str | None = None) -> dict:
     result = {"size": size.name, "params": count_parameters(size), "context_length": context_length, "mode": mode}
     model = optimizer = None
     try:
         if device.startswith("cuda"):
             torch.cuda.reset_peak_memory_stats()
+        if memory_snapshot:
+            # start before build_model so the weight allocations are part of the history
+            torch.cuda.memory._record_memory_history(max_entries=MEMORY_HISTORY_MAX_ENTRIES)
+            result["memory_snapshot"] = memory_snapshot
         model = build_model(size, context_length, device)
         optimizer = AdamW(model.parameters()) if mode == "train" else None
         x, y = random_batch(batch_size, context_length, device)
@@ -125,9 +154,16 @@ def benchmark(size: ModelSize, context_length: int, batch_size: int, mode: str, 
         result["step"] = mean_std_ms([sum(m.values()) for m in measured])
         if device.startswith("cuda"):
             result["peak_mem_gb"] = torch.cuda.max_memory_allocated() / 1e9
+        if memory_snapshot:
+            dump_memory_snapshot(memory_snapshot)
     except torch.OutOfMemoryError:
         result["oom"] = True
+        if memory_snapshot:
+            # dump before cleanup: the snapshot at the moment of OOM shows exactly what filled the GPU
+            dump_memory_snapshot(memory_snapshot)
     finally:
+        if memory_snapshot:
+            torch.cuda.memory._record_memory_history(enabled=None)  # stop recording
         # free everything before the next config so one size's memory never leaks into the next
         del model, optimizer
         gc.collect()
@@ -170,7 +206,13 @@ def main() -> None:
     parser.add_argument("--d-ff", type=int)
     parser.add_argument("--num-layers", type=int)
     parser.add_argument("--num-heads", type=int)
+    # memory profiling: record allocator history from before model build and dump it here (CUDA only)
+    parser.add_argument("--memory-snapshot", metavar="PATH",
+                        help="write a PyTorch memory snapshot (.pickle) for pytorch.org/memory_viz; "
+                             "with --size all, one file per size: PATH_<size>.pickle")
     args = parser.parse_args()
+    if args.memory_snapshot and not args.device.startswith("cuda"):
+        parser.error("--memory-snapshot requires a CUDA device")
 
     sizes = list(MODEL_SIZES.values()) if args.size == "all" else [MODEL_SIZES[args.size]]
     overrides = {k: getattr(args, k) for k in ("d_model", "d_ff", "num_layers", "num_heads") if getattr(args, k) is not None}
@@ -179,11 +221,16 @@ def main() -> None:
 
     print(f"device={args.device} batch={args.batch_size} ctx={args.context_length} mode={args.mode} "
           f"warmup={args.warmup} steps={args.steps}")
+    if args.memory_snapshot:
+        print("  memory snapshot recording is on: timings below include recording overhead and are not "
+              "comparable with plain runs")
     results = []
     for size in sizes:
         print(f"  {size.name}: {count_parameters(size) / 1e6:.0f}M params, "
               f"~{training_state_gb(size):.1f} GB fp32 training state (before activations) ...", flush=True)
-        results.append(benchmark(size, args.context_length, args.batch_size, args.mode, args.warmup, args.steps, args.device))
+        snapshot = snapshot_path(args.memory_snapshot, size.name, len(sizes) > 1) if args.memory_snapshot else None
+        results.append(benchmark(size, args.context_length, args.batch_size, args.mode, args.warmup, args.steps,
+                                 args.device, memory_snapshot=snapshot))
     print()
     print(format_table(results))
 

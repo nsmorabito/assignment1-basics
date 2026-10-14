@@ -13,6 +13,8 @@ data/
 # profiler outputs (Nsight Systems reports and their exported databases)
 *.nsys-rep
 *.sqlite
+# PyTorch memory snapshots
+*.pickle
 
 # Distribution / packaging
 .Python
